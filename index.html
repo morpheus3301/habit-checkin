@@ -1693,5 +1693,866 @@
   }, 60000);
 })();
 </script>
+<!-- ==================== 云同步（新增）开始 ==================== -->
+<script type="text/plain" id="hsWidgetSrc">
+// ============================================================
+//  习惯打卡 · 小组件（Scriptable）
+//  —— 今天「已完成 / 待完成」的习惯数量
+//  支持两种位置：
+//    · 桌面小组件（小 / 中 / 大号）—— 有颜色、有进度条、能点开网页
+//    · 锁屏小组件（圆形 / 矩形 / 时间上方的行内）—— 系统强制单色，只保留形状和深浅
+//  数据来源：index.html 里的「云同步」自动上传到 GitHub Gist 的那份 JSON
+//  用法：把下面 3 个常量填好，存成脚本，然后加到桌面或锁屏即可
+// ============================================================
+
+const GIST_ID   = "";                    // ← 必填：网页「设置云同步」里显示的 Gist ID
+const TOKEN     = "";                    // ← 选填：和网页里填的同一个 GitHub Token（填了更稳，不填也能用）
+const APP_URL   = "";                    // ← 选填：点桌面小组件时打开你的打卡网页（锁屏上不支持点击）
+
+const FILE_NAME = "habit-data.json";
+const API       = "https://api.github.com";
+
+const ACCENT = new Color("#F7A8C4");
+const TEXT   = new Color("#FFFFFF");
+const DIM    = new Color("#FFFFFF", 0.72);
+const DIM2   = new Color("#FFFFFF", 0.42);
+// 锁屏下颜色会被系统抹掉，只有「深浅」有效，所以这里用不同透明度表达层次
+const LOCK_DIM = new Color("#FFFFFF", 0.62);
+const LOCK_FAINT = new Color("#FFFFFF", 0.34);
+
+/* ==================== 一、和网页一致的日期 / 排期逻辑 ==================== */
+const pad2 = n => (n < 10 ? "0" + n : "" + n);
+const keyOf = d => d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+const todayKey = () => keyOf(new Date());
+const startOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+
+function isDated(h) { return !!(h.schedule && h.schedule.type === "dates"); }
+function scheduleDates(h) { return isDated(h) ? (h.schedule.dates || []) : []; }
+
+// 某一天需要完成的习惯
+function habitsOn(state, key) {
+  return (state.habits || []).filter(h => {
+    if (h.createdAt && keyOf(new Date(h.createdAt)) > key) return false;
+    if (!isDated(h)) return true;
+    return scheduleDates(h).indexOf(key) !== -1;
+  });
+}
+function doneCount(state, key) {
+  const ids = Array.isArray(state.log && state.log[key]) ? state.log[key] : [];
+  const on = habitsOn(state, key).map(h => h.id);
+  return ids.filter(id => on.indexOf(id) !== -1).length;
+}
+function isDone(state, id, key) {
+  const ids = Array.isArray(state.log && state.log[key]) ? state.log[key] : [];
+  return ids.indexOf(id) !== -1;
+}
+// 连续打卡（和网页同一套算法）
+function streakDays(state) {
+  let floor = null;
+  (state.habits || []).forEach(h => {
+    if (!h.createdAt) return;
+    const d = startOfDay(new Date(h.createdAt));
+    if (!floor || d < floor) floor = d;
+  });
+  Object.keys(state.log || {}).forEach(k => {
+    if (!state.log[k] || !state.log[k].length) return;
+    const p = String(k).split("-");
+    const d = new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+    if (!floor || d < floor) floor = d;
+  });
+
+  let cur = 0, guard = 0;
+  const d = startOfDay(new Date());
+  if (habitsOn(state, keyOf(d)).length > 0 && doneCount(state, keyOf(d)) === 0) d.setDate(d.getDate() - 1);
+  while (guard++ < 3700) {
+    if (floor && d < floor) break;
+    const key = keyOf(d);
+    if (habitsOn(state, key).length === 0) { d.setDate(d.getDate() - 1); continue; }
+    if (doneCount(state, key) > 0) { cur++; d.setDate(d.getDate() - 1); } else break;
+  }
+  return cur;
+}
+// 汇总今天的情况
+function summary(state) {
+  const key = todayKey();
+  const total = habitsOn(state, key).length;
+  const done = doneCount(state, key);
+  return { key, total, done, left: Math.max(total - done, 0), ratio: total ? done / total : 0 };
+}
+
+/* ==================== 二、取数据（失败时用本机缓存兜底） ==================== */
+async function loadData(shortTimeout) {
+  const fm = FileManager.local();
+  const cachePath = fm.joinPath(fm.documentsDirectory(), "habit-widget-cache.json");
+  try {
+    if (!GIST_ID) throw new Error("还没填 GIST_ID");
+    const req = new Request(`${API}/gists/${GIST_ID}`);
+    const headers = { "Accept": "application/vnd.github+json" };
+    if (TOKEN) headers["Authorization"] = `Bearer ${TOKEN}`;
+    req.headers = headers;
+    // 锁屏小组件对耗时更敏感，给它更短的超时，宁可先显示缓存
+    req.timeoutInterval = shortTimeout ? 8 : 20;
+    const g = await req.loadJSON();
+    const file = g && g.files && g.files[FILE_NAME];
+    if (!file || !file.content) throw new Error("云端还没有数据");
+    fm.writeString(cachePath, file.content);
+    return { data: JSON.parse(file.content), offline: false };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (fm.fileExists(cachePath)) {
+      try { return { data: JSON.parse(fm.readString(cachePath)), offline: true, error: msg }; } catch (e2) {}
+    }
+    return { data: null, offline: true, error: msg };
+  }
+}
+
+/* ==================== 三、画图（进度条 / 圆环） ==================== */
+function barImage(ratio, width, height, dim) {
+  const ctx = new DrawContext();
+  ctx.size = new Size(width, height);
+  ctx.opaque = false;
+  ctx.respectScreenScale = true;
+  const r = height / 2;
+
+  const track = new Path();
+  track.addRoundedRect(new Rect(0, 0, width, height), r, r);
+  ctx.addPath(track);
+  ctx.setFillColor(dim ? new Color("#FFFFFF", 0.28) : new Color("#FFFFFF", 0.16));
+  ctx.fillPath();
+
+  const wpx = ratio <= 0 ? 0 : Math.max(height, width * Math.min(ratio, 1));
+  if (wpx > 0) {
+    const fill = new Path();
+    fill.addRoundedRect(new Rect(0, 0, wpx, height), r, r);
+    ctx.addPath(fill);
+    ctx.setFillColor(dim ? new Color("#FFFFFF", 1) : ACCENT);
+    ctx.fillPath();
+  }
+  return ctx.getImage();
+}
+function addBar(widget, ratio, width, height, dim) {
+  const img = widget.addImage(barImage(ratio, width, height, dim));
+  img.imageSize = new Size(width, height);
+  img.cornerRadius = 0;
+  return img;
+}
+// 圆环进度（Path 没有 addArc，用密集折线逼近圆弧）
+function ringImage(ratio, size) {
+  const ctx = new DrawContext();
+  ctx.size = new Size(size, size);
+  ctx.opaque = false;
+  ctx.respectScreenScale = true;
+
+  const lw = Math.max(5, size * 0.095);
+  const r = (size - lw) / 2 - 1;
+  const cx = size / 2, cy = size / 2;
+
+  const track = new Path();
+  track.addEllipse(new Rect(cx - r, cy - r, r * 2, r * 2));
+  ctx.addPath(track);
+  ctx.setStrokeColor(new Color("#FFFFFF", 0.3));
+  ctx.setLineWidth(lw);
+  ctx.strokePath();
+
+  const p = Math.min(Math.max(ratio, 0), 1);
+  if (p > 0.002) {
+    const sweep = Math.PI * 2 * p;
+    const steps = Math.max(4, Math.ceil(sweep / 0.09));
+    const arc = new Path();
+    for (let i = 0; i <= steps; i++) {
+      const a = -Math.PI / 2 + sweep * (i / steps);
+      const pt = new Point(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+      if (i === 0) arc.move(pt); else arc.addLine(pt);
+    }
+    ctx.addPath(arc);
+    ctx.setStrokeColor(new Color("#FFFFFF", 1));
+    ctx.setLineWidth(lw);
+    ctx.strokePath();
+  }
+  return ctx.getImage();
+}
+
+/* ==================== 四、桌面小组件渲染 ==================== */
+function gradient() {
+  const g = new LinearGradient();
+  g.colors = [new Color("#1C1C1E"), new Color("#0B0B0C")];
+  g.locations = [0, 1];
+  return g;
+}
+function dimText(stack, str, size, color) {
+  const t = stack.addText(str);
+  t.font = Font.systemFont(size || 11);
+  t.textColor = color || DIM2;
+  t.lineLimit = 1;
+  return t;
+}
+function renderHome(w, st, res, family, sum) {
+  const wide = family === "medium" || family === "large" || family === "extraLarge";
+
+  /* 顶部标题 */
+  const head = w.addStack();
+  head.centerAlignContent();
+  const title = head.addText("🐾 今日打卡");
+  title.font = Font.semiboldSystemFont(11);
+  title.textColor = DIM;
+  head.addSpacer();
+  dimText(head, res.offline ? "离线缓存" : "已同步", 10, DIM2);
+
+  w.addSpacer(wide ? 8 : 6);
+
+  /* 主体 */
+  const body = w.addStack();
+  body.spacing = 14;
+
+  const leftCol = body.addStack();
+  leftCol.layoutVertically();
+  leftCol.spacing = 4;
+
+  const numRow = leftCol.addStack();
+  numRow.centerAlignContent();
+  const big = numRow.addText(String(sum.done));
+  big.font = Font.boldSystemFont(wide ? 34 : 32);
+  big.textColor = TEXT;
+  const slash = numRow.addText(" / " + sum.total);
+  slash.font = Font.mediumSystemFont(15);
+  slash.textColor = DIM2;
+  const unit = numRow.addText(" 项");
+  unit.font = Font.systemFont(10);
+  unit.textColor = DIM2;
+
+  dimText(leftCol, `已完成 ${sum.done} · 待完成 ${sum.left}`, 11, DIM);
+  leftCol.addSpacer(4);
+  addBar(leftCol, sum.ratio, wide ? 116 : 108, 7, false);
+
+  /* 右侧：习惯清单（medium / large 才显示） */
+  if (wide) {
+    body.addSpacer(2);
+    const rightCol = body.addStack();
+    rightCol.layoutVertically();
+    rightCol.spacing = 3;
+
+    const onAll = habitsOn(st, sum.key);
+    const list = onAll.slice(0, family === "large" ? 9 : 5);
+    const rest = onAll.length - list.length;
+    list.forEach(h => {
+      const ok = isDone(st, h.id, sum.key);
+      const row = rightCol.addStack();
+      row.centerAlignContent();
+      row.spacing = 5;
+      const mark = row.addText(ok ? "●" : "○");
+      mark.font = Font.systemFont(8);
+      mark.textColor = ok ? ACCENT : DIM2;
+      const name = row.addText(h.name || "未命名");
+      name.font = Font.systemFont(11);
+      name.textColor = ok ? DIM2 : DIM;
+      name.lineLimit = 1;
+    });
+    if (rest > 0) dimText(rightCol, `还有 ${rest} 项…`, 10, DIM2);
+  }
+
+  w.addSpacer();
+
+  /* 底部：连续打卡 */
+  const s = streakDays(st);
+  const foot = w.addStack();
+  foot.centerAlignContent();
+  dimText(foot, s > 0 ? `🔥 连续打卡 ${s} 天` : "今天还没开始", 10.5, DIM2);
+}
+
+/* ==================== 五、锁屏小组件渲染（系统会强制单色） ==================== */
+function renderLockRect(w, st, res, sum) {
+  const s = streakDays(st);
+  const row = w.addStack();
+  row.centerAlignContent();
+  const t1 = row.addText("今日打卡");
+  t1.font = Font.systemFont(11);
+  t1.textColor = LOCK_DIM;
+  row.addSpacer();
+  const t2 = row.addText(`${sum.done}/${sum.total}`);
+  t2.font = Font.systemFont(11);
+  t2.textColor = LOCK_FAINT;
+
+  w.addSpacer(3);
+
+  const line = w.addText(`已完成 ${sum.done} · 待完成 ${sum.left}`);
+  line.font = Font.boldSystemFont(15);
+  line.textColor = TEXT;
+  line.lineLimit = 1;
+
+  w.addSpacer(4);
+  addBar(w, sum.ratio, 150, 5, true);
+
+  if (s > 0) {
+    w.addSpacer(3);
+    const f = w.addText(`连续 ${s} 天`);
+    f.font = Font.systemFont(10);
+    f.textColor = LOCK_FAINT;
+  }
+}
+function renderLockCircle(w, res, sum) {
+  const S = 72;
+  const box = w.addStack();
+  box.size = new Size(S, S);
+  box.backgroundImage = ringImage(sum.ratio, S);
+  box.centerAlignContent();
+
+  const txt = box.addText(`${sum.done}/${sum.total}`);
+  txt.font = Font.boldSystemFont(17);
+  txt.textColor = TEXT;
+  txt.lineLimit = 1;
+}
+function renderLockInline(w, res, sum) {
+  const t = w.addText(`已完成 ${sum.done} · 待完成 ${sum.left}`);
+  t.font = Font.systemFont(14);
+  t.textColor = TEXT;
+  t.lineLimit = 1;
+}
+function renderErr(w, res, short) {
+  const t = w.addText(short ? "🐾 拿不到数据" : "🐾 今天");
+  t.font = Font.semiboldSystemFont(short ? 12 : 13);
+  t.textColor = TEXT;
+  if (short) return;
+  w.addSpacer(6);
+  const m = w.addText(res.error || "未知错误");
+  m.font = Font.systemFont(10);
+  m.textColor = DIM2;
+  m.lineLimit = 3;
+}
+
+/* ==================== 六、入口 ==================== */
+const family = config.widgetFamily || "small";
+const isAccessory = !!config.runsInAccessoryWidget || family.indexOf("accessory") === 0;
+const isInline = family === "accessoryInline";
+
+const w = new ListWidget();
+if (isAccessory) {
+  // 锁屏：不要背景、不要内边距，系统的样式说了算
+  w.refreshAfterDate = new Date(Date.now() + 10 * 60 * 1000);
+} else {
+  w.setPadding(14, 16, 14, 16);
+  w.backgroundGradient = gradient();
+  if (APP_URL) w.url = APP_URL;
+  w.refreshAfterDate = new Date(Date.now() + 15 * 60 * 1000);
+}
+
+const res = await loadData(isAccessory);
+
+if (!res.data) {
+  renderErr(w, res, isInline);
+} else {
+  const sum = summary(res.data);
+  const empty = !(res.data.habits || []).length;
+
+  if (isInline) {
+    if (empty) renderErr(w, res, true);
+    else renderLockInline(w, res, sum);
+  } else if (family === "accessoryCircular") {
+    if (empty) renderErr(w, res, true);
+    else renderLockCircle(w, res, sum);
+  } else if (family === "accessoryRectangular") {
+    if (empty) {
+      const t = w.addText("🐾 还没有习惯");
+      t.font = Font.semiboldSystemFont(13);
+      t.textColor = TEXT;
+      const m = w.addText("去网页点一下「上传」");
+      m.font = Font.systemFont(11);
+      m.textColor = LOCK_DIM;
+    } else {
+      renderLockRect(w, res.data, res, sum);
+    }
+  } else if (empty) {
+    const t0 = w.addText("🐾 还没有习惯");
+    t0.font = Font.semiboldSystemFont(12);
+    t0.textColor = DIM;
+    w.addSpacer(6);
+    const t1 = w.addText("去网页点一下「上传」");
+    t1.font = Font.systemFont(11);
+    t1.textColor = DIM2;
+    w.addSpacer();
+  } else {
+    renderHome(w, res.data, res, family, sum);
+  }
+}
+
+if (config.runsInWidget) {
+  Script.setWidget(w);
+} else if (family === "large") {
+  await w.presentLarge();
+} else if (family === "medium") {
+  await w.presentMedium();
+} else {
+  await w.presentSmall();
+}
+Script.complete();
+</script>
+<script>
+/* ================================================================
+   习惯打卡 · 云同步 v1
+   —— 本块是新增内容，整段删除即可完全恢复原状 ——
+   作用：把打卡数据自动上传到你的 GitHub 私密 Gist，
+        iPhone 上的 Scriptable 桌面小组件读取同一份数据。
+   用法：展开「设置云同步」，粘贴一个只有 gist 权限的 GitHub Token，
+        点「保存并连接」即可。之后每次打卡自动上传。
+   ================================================================ */
+(function () {
+  "use strict";
+
+  var STORE_KEY = "habit-tracker-v1";
+  var CFG_KEY   = "habit-sync-v1";
+  var FILE_NAME = "habit-data.json";
+  var GIST_DESC = "habit-tracker-sync";
+  var API       = "https://api.github.com";
+
+  var cfg = { token: "", gistId: "", auto: true, lastAt: 0 };
+  var busy = false;
+  var queued = false;
+  var pushTimer = null;
+  var lastFingerprint = "";
+  var lastError = "";
+  var ui = {};
+
+  var rawGet = localStorage.getItem.bind(localStorage);
+  var rawSet = localStorage.setItem.bind(localStorage);
+  var rawDel = localStorage.removeItem.bind(localStorage);
+
+  /* ---------------- 本地数据 ---------------- */
+  function readRaw() { return rawGet(STORE_KEY) || ""; }
+  function readDoc() {
+    try { return JSON.parse(readRaw() || "{}") || {}; } catch (e) { return {}; }
+  }
+
+  /* ---------------- 配置 ---------------- */
+  function loadCfg() {
+    try {
+      var o = JSON.parse(rawGet(CFG_KEY) || "{}") || {};
+      if (typeof o.token === "string") cfg.token = o.token;
+      if (typeof o.gistId === "string") cfg.gistId = o.gistId;
+      if (typeof o.auto === "boolean") cfg.auto = o.auto;
+      if (typeof o.lastAt === "number") cfg.lastAt = o.lastAt;
+    } catch (e) {}
+  }
+  function saveCfg() {
+    try {
+      rawSet(CFG_KEY, JSON.stringify({
+        token: cfg.token, gistId: cfg.gistId, auto: cfg.auto, lastAt: cfg.lastAt
+      }));
+    } catch (e) {}
+  }
+  function ready() { return !!(cfg.token && cfg.gistId); }
+
+  /* ---------------- GitHub API ---------------- */
+  function api(path, opt) {
+    opt = opt || {};
+    var headers = {
+      "Accept": "application/vnd.github+json",
+      "Authorization": "Bearer " + cfg.token
+    };
+    if (opt.body) headers["Content-Type"] = "application/json";
+    var init = { method: opt.method || "GET", headers: headers, cache: "no-store" };
+    if (opt.body) init.body = JSON.stringify(opt.body);
+    if (opt.keepalive) init.keepalive = true;
+    return fetch(API + path, init).then(function (res) {
+      if (res.ok) return res.json();
+      return res.text().then(function (t) {
+        var msg = "HTTP " + res.status;
+        try { var j = JSON.parse(t); if (j && j.message) msg = j.message; } catch (e) {}
+        throw new Error(msg + "（" + res.status + "）");
+      });
+    });
+  }
+
+  /* ---------------- 工具 ---------------- */
+  function fingerprint(doc) {
+    var c = {};
+    for (var k in doc) if (Object.prototype.hasOwnProperty.call(doc, k)) c[k] = doc[k];
+    delete c.updatedAt;
+    return JSON.stringify(c);
+  }
+  function clock(ts) {
+    var d = new Date(ts), n = new Date(), p = function (x) { return x < 10 ? "0" + x : "" + x; };
+    var hm = p(d.getHours()) + ":" + p(d.getMinutes());
+    if (d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate()) return hm;
+    return (d.getMonth() + 1) + "/" + d.getDate() + " " + hm;
+  }
+  function guardReload() {
+    try {
+      var k = "habit-sync-reload";
+      var last = Number(sessionStorage.getItem(k) || 0);
+      if (Date.now() - last < 5000) return false;
+      sessionStorage.setItem(k, String(Date.now()));
+      return true;
+    } catch (e) { return true; }
+  }
+  function tip(s) { if (ui.tip) ui.tip.textContent = s; }
+
+  /* ---------------- 界面状态 ---------------- */
+  function paint() {
+    if (!ui.state) return;
+    var cls = "", txt;
+    if (busy) txt = "同步中…";
+    else if (!cfg.token) txt = "未开启";
+    else if (!cfg.gistId) txt = "待连接";
+    else if (lastError) { txt = "同步失败"; cls = "err"; }
+    else if (cfg.lastAt) { txt = "已同步 " + clock(cfg.lastAt); cls = "on"; }
+    else txt = "已连接";
+    ui.state.textContent = txt;
+    if (lastError) ui.state.title = lastError;
+    ui.card.classList.remove("on", "err");
+    if (cls) ui.card.classList.add(cls);
+    refreshId();
+    if (ui.chip) {
+      ui.chip.classList.remove("on", "err");
+      if (cls) ui.chip.classList.add(cls);
+      ui.chip.title = lastError || txt;
+    }
+  }
+  function refreshId() {
+    if (!ui.id) return;
+    if (cfg.gistId) {
+      ui.id.hidden = false;
+      ui.id.innerHTML = 'Gist ID：<code>' + cfg.gistId + '</code>' +
+        '<a class="hs-link2" href="https://gist.github.com/' + cfg.gistId + '" target="_blank" rel="noopener">在 GitHub 上打开（能看到历史版本，误覆盖可找回）</a>' +
+        '<span class="hs-note">把这个 Gist ID 填进 Scriptable 小组件脚本</span>';
+    } else {
+      ui.id.hidden = true;
+      ui.id.innerHTML = "";
+    }
+  }
+  function fail(e) {
+    lastError = (e && e.message) ? e.message : "网络错误";
+    busy = false;
+    paint();
+    tip("同步失败：" + lastError);
+  }
+  function succeed(msg, stamp) {
+    lastError = "";
+    busy = false;
+    if (stamp !== false) { cfg.lastAt = Date.now(); saveCfg(); }
+    paint();
+    if (msg) tip(msg);
+  }
+
+  /* ---------------- 上传 ---------------- */
+  function pushNow(manual, keepalive) {
+    if (!ready()) {
+      if (manual) tip("请先粘贴 Token 并点「保存并连接」");
+      return Promise.resolve(false);
+    }
+    if (busy) { queued = true; return Promise.resolve(false); }
+    var doc = readDoc();
+    if (!doc.habits && !doc.log) {
+      if (manual) tip("本机还没有打卡数据");
+      return Promise.resolve(false);
+    }
+    var fp = fingerprint(doc);
+    if (!manual && fp === lastFingerprint) return Promise.resolve(false);
+
+    doc.updatedAt = Date.now();
+    // GitHub 要求 PATCH 的请求体是 { files: { "文件名": { content } } }
+    var body = { files: {} };
+    body.files[FILE_NAME] = { content: JSON.stringify(doc) };
+
+    busy = true; paint();
+    if (manual) tip("正在上传…");
+    return api("/gists/" + cfg.gistId, { method: "PATCH", body: body, keepalive: !!keepalive })
+      .then(function () {
+        try { rawSet(STORE_KEY, JSON.stringify(doc)); } catch (e) {}
+        lastFingerprint = fp;
+        succeed(manual ? "已上传到云端 ✓" : "");
+        return true;
+      })
+      .catch(function (e) { fail(e); return false; })
+      .then(function (r) {
+        if (queued) { queued = false; return pushNow(false, false); }
+        return r;
+      });
+  }
+  function schedule() {
+    if (!cfg.auto || !ready()) return;
+    if (pushTimer) clearTimeout(pushTimer);
+    pushTimer = setTimeout(function () { pushTimer = null; pushNow(false, false); }, 1500);
+  }
+
+  /* ---------------- 下载 ---------------- */
+  function pull(force) {
+    if (!ready()) {
+      tip("请先粘贴 Token 并点「保存并连接」");
+      return Promise.resolve(false);
+    }
+    busy = true; paint();
+    tip("正在读取云端…");
+    return api("/gists/" + cfg.gistId)
+      .then(function (g) {
+        var f = g && g.files && g.files[FILE_NAME];
+        if (!f || !f.content) throw new Error("云端还没有数据文件");
+        var remote = JSON.parse(f.content);
+        var ru = typeof remote.updatedAt === "number" ? remote.updatedAt : 0;
+        var lu = readDoc().updatedAt;
+        lu = typeof lu === "number" ? lu : 0;
+        if (!force && ru <= lu) { succeed("云端数据没有更新"); return false; }
+        rawSet(STORE_KEY, JSON.stringify(remote));
+        lastFingerprint = "";
+        succeed("已从云端恢复 ✓");
+        return true;
+      })
+      .catch(function (e) { fail(e); return false; });
+  }
+
+  /* ---------------- 连接（新建或找到已有的云端文件） ---------------- */
+  function connect() {
+    var tk = (ui.token.value || "").trim();
+    if (!tk) { tip("请先粘贴 GitHub Token"); ui.token.focus(); return; }
+    cfg.token = tk;
+    saveCfg();
+    if (busy) return;
+    busy = true; paint();
+    tip("正在查找云端数据…");
+    api("/gists?per_page=100")
+      .then(function (list) {
+        var found = null, i;
+        if (Array.isArray(list)) {
+          for (i = 0; i < list.length; i++) {
+            var g = list[i];
+            if (g && g.description === GIST_DESC && g.files && g.files[FILE_NAME]) { found = g; break; }
+          }
+        }
+        if (found) { cfg.gistId = found.id; saveCfg(); return "found"; }
+        var files = {};
+        files[FILE_NAME] = { content: "{}" };
+        return api("/gists", {
+          method: "POST",
+          body: { description: GIST_DESC, public: false, files: files }
+        }).then(function (g) { cfg.gistId = g.id; saveCfg(); return "created"; });
+      })
+      .then(function (how) {
+        busy = false;
+        succeed(how === "created"
+          ? "已新建云端数据。点「上传」把本机数据传上去。"
+          : "已连上云端数据。点「恢复」下载到本机，或点「上传」用本机覆盖云端。", false);
+      })
+      .catch(function (e) { fail(e); });
+  }
+
+  /* ---------------- 页头入口：手机上不用一路滚到最下面 ---------------- */
+  function makeChip() {
+    var host = document.querySelector(".head-right") || document.querySelector("header");
+    if (!host || document.getElementById("hsChip")) return;
+    var b = document.createElement("button");
+    b.type = "button";
+    b.id = "hsChip";
+    b.className = "hs-chip";
+    b.innerHTML = '<span class="hs-dot"></span>云同步';
+    b.addEventListener("click", function () {
+      ui.wrap.hidden = false;
+      if (ui.more) ui.more.textContent = "收起设置";
+      if (ui.card.scrollIntoView) ui.card.scrollIntoView({ behavior: "smooth", block: "center" });
+      setTimeout(function () { try { ui.token.focus(); } catch (e) {} }, 350);
+    });
+    host.appendChild(b);
+    ui.chip = b;
+  }
+
+  /* ---------------- 复制小组件脚本（自动填好 Gist ID / Token / 网址） ---------------- */
+  function widgetScriptText() {
+    var el = document.getElementById("hsWidgetSrc");
+    var src = el ? (el.textContent || "") : "";
+    if (!src || src.indexOf("const GIST_ID") === -1) return "";
+    var url = (location && /^https?:$/.test(location.protocol)) ? location.href.split("#")[0] : "";
+    return src
+      .replace(/const GIST_ID\s*=\s*"[^"]*";/, 'const GIST_ID   = "' + cfg.gistId + '";')
+      .replace(/const TOKEN\s*=\s*"[^"]*";/, 'const TOKEN     = "' + cfg.token + '";')
+      .replace(/const APP_URL\s*=\s*"[^"]*";/, 'const APP_URL   = "' + url + '";')
+      .trim() + "\n";
+  }
+  function copyWidgetScript() {
+    var txt = widgetScriptText();
+    if (!txt) { tip("这个页面里没有内嵌小组件脚本"); return; }
+    if (!cfg.gistId) tip("提示：还没连接云端，脚本里的 Gist ID 会是空的");
+    var fb = function () {
+      ui.copyBox.hidden = false;
+      ui.code.value = txt;
+      try { ui.code.focus(); ui.code.select(); } catch (e) {}
+      tip("长按上面的文字 → 全选 → 拷贝，然后粘到 Scriptable 里");
+    };
+    if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).then(function () {
+        ui.copyBox.hidden = true;
+        tip("脚本已复制 ✓ 打开 Scriptable → 右上角 + → 长按粘贴");
+      }).catch(fb);
+    } else fb();
+  }
+  /* ---------------- 挂钩：每次保存自动上传 ---------------- */
+  function install() {
+    if (!window.localStorage) return;
+    var orig = localStorage.setItem;
+    localStorage.setItem = function (k, v) {
+      if (k === STORE_KEY) {
+        try {
+          var o = JSON.parse(v);
+          o.updatedAt = Date.now();
+          v = JSON.stringify(o);
+        } catch (e) {}
+        lastFingerprint = "";
+        schedule();
+      }
+      return orig.call(localStorage, k, v);
+    };
+  }
+
+  /* ---------------- 界面 ---------------- */
+  var CSS = [
+    "#hsCard{margin-top:18px;padding:16px 18px 14px;border-radius:var(--radius,22px);border:3px solid var(--ink,#2a2a2a);background:var(--card-2,#171717);color:var(--text,#fff);box-shadow:0 4px 0 var(--ink,#2a2a2a);}",
+    "#hsCard [hidden]{display:none!important}",
+    "#hsCard .hs-top{display:flex;align-items:center;gap:8px}",
+    "#hsCard .hs-dot{width:9px;height:9px;border-radius:50%;background:#6E6E6E;flex:0 0 auto}",
+    "#hsCard.on .hs-dot{background:#4ADE80;box-shadow:0 0 8px rgba(74,222,128,.7)}",
+    "#hsCard.err .hs-dot{background:#F87171;box-shadow:0 0 8px rgba(248,113,113,.7)}",
+    "#hsCard .hs-name{font-size:13px;font-weight:800;letter-spacing:.06em}",
+    "#hsCard .hs-state{margin-left:auto;font-size:11.5px;font-weight:700;color:var(--text-3,#8a8a8a);text-align:right}",
+    "#hsCard .hs-more{display:block;width:100%;margin-top:12px;padding:9px 12px;border-radius:12px;border:1.5px solid var(--line,#333);background:transparent;color:var(--text-2,#bdbdbd);font:inherit;font-size:12.5px;font-weight:800;cursor:pointer}",
+    "#hsCard .hs-more:hover{border-color:var(--text-3,#8a8a8a);color:var(--text,#fff)}",
+    "#hsCard .hs-wrap{margin-top:12px;display:flex;flex-direction:column;gap:9px}",
+    "#hsCard .hs-label{font-size:11.5px;font-weight:700;color:var(--text-3,#8a8a8a)}",
+    "#hsCard .hs-input{width:100%;padding:9px 12px;border-radius:11px;border:1.5px solid var(--line,#333);background:var(--card,#0f0f0f);color:var(--text,#fff);font:inherit;font-size:13px;outline:none}",
+    "#hsCard .hs-input:focus{border-color:#F7A8C4}",
+    "#hsCard .hs-btns{display:flex;gap:7px}",
+    "#hsCard .hs-btn{flex:1;padding:9px 6px;border-radius:11px;border:1.5px solid var(--line,#333);background:transparent;color:var(--text-2,#bdbdbd);font:inherit;font-size:12.5px;font-weight:800;cursor:pointer;white-space:nowrap}",
+    "#hsCard .hs-btn:hover{color:var(--text,#fff);border-color:var(--text-3,#8a8a8a)}",
+    "#hsCard .hs-main{border-color:#F7A8C4;color:#F7A8C4}",
+    "#hsCard .hs-check{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:700;color:var(--text-2,#bdbdbd);cursor:pointer}",
+    "#hsCard .hs-tip{font-size:11.5px;line-height:1.6;font-weight:600;color:var(--text-3,#8a8a8a);word-break:break-all}",
+    "#hsCard .hs-id{font-size:11.5px;font-weight:700;color:var(--text-2,#bdbdbd);word-break:break-all;-webkit-user-select:text;user-select:text}",
+    "#hsCard .hs-id code{background:var(--card,#0f0f0f);border:1px solid var(--line,#333);border-radius:7px;padding:1px 6px;font-size:11px}",
+    "#hsCard .hs-link2{display:block;margin-top:5px;font-size:11.5px;font-weight:700;color:#F7A8C4;text-decoration:underline;word-break:break-all}",
+    "#hsCard .hs-note{display:block;margin-top:4px;font-weight:600;color:var(--text-3,#8a8a8a)}",
+    "#hsCard .hs-copy{display:block;width:100%;padding:10px 12px;border-radius:12px;border:1.5px solid #F7A8C4;background:transparent;color:#F7A8C4;font:inherit;font-size:12.5px;font-weight:800;cursor:pointer}",
+    "#hsCard .hs-copy:active{opacity:.55}",
+    "#hsCard .hs-copybox{display:flex;flex-direction:column;gap:6px}",
+    "#hsCard .hs-code{width:100%;box-sizing:border-box;padding:9px 11px;border-radius:11px;border:1.5px solid var(--line,#333);background:var(--card,#0f0f0f);color:var(--text-2,#bdbdbd);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:10.5px;line-height:1.5;resize:vertical;outline:none}",
+    "#hsCard .hs-code:focus{border-color:#F7A8C4}",
+    ".hs-chip{display:inline-flex;align-items:center;gap:6px;margin-top:8px;padding:5px 11px;border-radius:999px;border:1.5px solid var(--line,#3a3a3a);background:var(--card,#0f0f0f);color:var(--text-2,#bdbdbd);font:inherit;font-size:11.5px;font-weight:800;cursor:pointer}",
+    ".hs-chip:active{opacity:.6}",
+    ".hs-chip .hs-dot{width:7px;height:7px;border-radius:50%;background:#8a8a8a;flex:0 0 auto}",
+    ".hs-chip.on .hs-dot{background:#4ADE80;box-shadow:0 0 7px rgba(74,222,128,.75)}",
+    ".hs-chip.err .hs-dot{background:#F87171;box-shadow:0 0 7px rgba(248,113,113,.75)}",
+    "#hsCard .hs-del{align-self:flex-start;padding:0;border:0;background:none;color:var(--text-3,#8a8a8a);font:inherit;font-size:11.5px;font-weight:700;text-decoration:underline;cursor:pointer}"
+  ].join("");
+
+  var MARKUP = [
+    '<div class="hs-top">',
+    '  <span class="hs-dot"></span>',
+    '  <span class="hs-name">云同步</span>',
+    '  <span class="hs-state" id="hsState">未开启</span>',
+    '</div>',
+    '<div class="hs-wrap" id="hsWrap" hidden>',
+    '  <div class="hs-label">GitHub Token（只需勾选 Gist 权限）</div>',
+    '  <input class="hs-input" id="hsToken" type="password" autocomplete="off" spellcheck="false" placeholder="ghp_xxxxxxxxxxxx">',
+    '  <div class="hs-btns">',
+    '    <button class="hs-btn hs-main" id="hsConnect" type="button">保存并连接</button>',
+    '    <button class="hs-btn" id="hsPush" type="button">上传</button>',
+    '    <button class="hs-btn" id="hsPull" type="button">恢复</button>',
+    '  </div>',
+    '  <label class="hs-check"><input type="checkbox" id="hsAuto"> 打开页面时自动同步</label>',
+    '  <div class="hs-id" id="hsId" hidden></div>',
+    '  <button class="hs-copy" id="hsCopy" type="button">📋 复制小组件脚本</button>',
+    '  <div class="hs-copybox" id="hsCopyBox" hidden>',
+    '    <div class="hs-label">复制失败了，长按下面的文字 → 全选 → 拷贝</div>',
+    '    <textarea class="hs-code" id="hsCode" readonly rows="6"></textarea>',
+    '  </div>',
+    '  <div class="hs-tip" id="hsTip"></div>',
+    '  <button class="hs-del" id="hsDel" type="button">清除本机 Token 与连接</button>',
+    '</div>',
+    '<button class="hs-more" id="hsMore" type="button">设置云同步</button>'
+  ].join("");
+
+  function mount() {
+    if (ui.card) return;
+    var host = document.querySelector(".side") || document.querySelector(".main") || document.body;
+    var poster = host.querySelector ? host.querySelector(".poster-float") : null;
+
+    var st = document.createElement("style");
+    st.id = "hsStyle";
+    st.textContent = CSS;
+    document.head.appendChild(st);
+
+    var card = document.createElement("section");
+    card.id = "hsCard";
+    card.innerHTML = MARKUP;
+    if (poster) host.insertBefore(card, poster); else host.appendChild(card);
+
+    ui.card    = card;
+    ui.state   = card.querySelector("#hsState");
+    ui.wrap    = card.querySelector("#hsWrap");
+    ui.more    = card.querySelector("#hsMore");
+    ui.token   = card.querySelector("#hsToken");
+    ui.auto    = card.querySelector("#hsAuto");
+    ui.tip     = card.querySelector("#hsTip");
+    ui.id      = card.querySelector("#hsId");
+    ui.copy    = card.querySelector("#hsCopy");
+    ui.copyBox = card.querySelector("#hsCopyBox");
+    ui.code    = card.querySelector("#hsCode");
+
+    ui.auto.checked = cfg.auto;
+    ui.token.value = cfg.token;
+
+    makeChip();
+
+    ui.more.addEventListener("click", function () {
+      if (ui.wrap.hidden) { ui.wrap.hidden = false; ui.more.textContent = "收起设置"; }
+      else { ui.wrap.hidden = true; ui.more.textContent = "设置云同步"; }
+    });
+    card.querySelector("#hsConnect").addEventListener("click", connect);
+    card.querySelector("#hsPush").addEventListener("click", function () { pushNow(true, false); });
+    ui.copy.addEventListener("click", copyWidgetScript);
+    card.querySelector("#hsPull").addEventListener("click", function () {
+      pull(true).then(function (ok) { if (ok) location.reload(); });
+    });
+    ui.auto.addEventListener("change", function () {
+      cfg.auto = ui.auto.checked;
+      saveCfg();
+      tip(cfg.auto ? "已开启自动同步" : "已关闭自动同步（仍可手动上传）");
+    });
+    card.querySelector("#hsDel").addEventListener("click", function () {
+      cfg.token = ""; cfg.gistId = ""; cfg.lastAt = 0; lastError = "";
+      try { rawDel(CFG_KEY); } catch (e) {}
+      ui.token.value = "";
+      tip("已清除。本机打卡数据没有动。");
+      paint();
+    });
+  }
+
+  /* ---------------- 启动 ---------------- */
+  function boot() {
+    loadCfg();
+    install();
+    mount();
+    paint();
+    tip(cfg.gistId ? "" : "粘贴 Token 后点「保存并连接」，会自动新建一个私密 Gist 存放数据。");
+    if (ready() && cfg.auto) {
+      var lastOk = cfg.lastAt;
+      pull(false).then(function (changed) {
+        if (changed) { if (guardReload()) location.reload(); return; }
+        // 上一次没能上传成功的本地改动（比如当时断网、上传失败），这次打开补传
+        var lu = readDoc().updatedAt;
+        if (typeof lu !== "number") lu = 0;
+        if (lu > lastOk) pushNow(false, false);
+      });
+    }
+    var flush = function () { if (ready() && cfg.auto) pushNow(false, true); };
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "hidden") flush();
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot);
+  } else {
+    boot();
+  }
+})();
+/* ====================== 云同步 结束 ====================== */
+</script>
+<!-- ==================== 云同步（新增）结束 ==================== -->
 </body>
 </html>
